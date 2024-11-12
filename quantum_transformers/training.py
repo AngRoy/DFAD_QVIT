@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import flax.linen as nn
 import flax.training.train_state
 import optax
-from sklearn.metrics import roc_auc_score, roc_curve, auc, classification_report
+from sklearn.metrics import roc_auc_score, roc_curve, auc, classification_report, accuracy_score
 from tqdm import tqdm
 
 TQDM_BAR_FORMAT = '{l_bar}{bar:10}{r_bar}{bar:-10b}'
@@ -18,13 +18,14 @@ class TrainState(flax.training.train_state.TrainState):
     key: jax.random.KeyArray  # type: ignore
 
 @jax.jit
-def train_step(state: TrainState, inputs: jax.Array, labels: jax.Array, key: jax.random.KeyArray) -> TrainState:
+def train_step(state: TrainState, inputs_spectrogram: jax.Array, inputs_tabular: jax.Array, labels: jax.Array, key: jax.random.KeyArray) -> TrainState:
     """
     Performs a single training step on the given batch of inputs and labels.
 
     Args:
         state: The current training state.
-        inputs: The batch of inputs.
+        inputs_spectrogram: Batch of spectrogram inputs.
+        inputs_tabular: Batch of tabular inputs.
         labels: The batch of labels.
         key: The random key to use.
 
@@ -37,7 +38,8 @@ def train_step(state: TrainState, inputs: jax.Array, labels: jax.Array, key: jax
     def loss_fn(params):
         logits = state.apply_fn(
             {'params': params},
-            x=inputs,
+            x_spectrogram=inputs_spectrogram,
+            x_tabular=inputs_tabular,
             train=True,
             rngs={'dropout': dropout_train_key}
         )
@@ -54,13 +56,14 @@ def train_step(state: TrainState, inputs: jax.Array, labels: jax.Array, key: jax
     return state
 
 @jax.jit
-def eval_step(state: TrainState, inputs: jax.Array, labels: jax.Array) -> tuple[float, jax.Array]:
+def eval_step(state: TrainState, inputs_spectrogram: jax.Array, inputs_tabular: jax.Array, labels: jax.Array) -> tuple[float, jax.Array]:
     """
     Performs a single evaluation step on the given batch of inputs and labels.
 
     Args:
         state: The current training state.
-        inputs: The batch of inputs.
+        inputs_spectrogram: Batch of spectrogram inputs.
+        inputs_tabular: Batch of tabular inputs.
         labels: The batch of labels.
 
     Returns:
@@ -69,7 +72,8 @@ def eval_step(state: TrainState, inputs: jax.Array, labels: jax.Array) -> tuple[
     """
     logits = state.apply_fn(
         {'params': state.params},
-        x=inputs,
+        x_spectrogram=inputs_spectrogram,
+        x_tabular=inputs_tabular,
         train=False,
         rngs={'dropout': state.key}
     )
@@ -105,8 +109,8 @@ def evaluate(state: TrainState, eval_dataloader, num_classes: int,
     logits_list, labels_list = [], []
     eval_loss = 0.0
     with tqdm(total=len(eval_dataloader), desc=tqdm_desc, unit="batch", bar_format=TQDM_BAR_FORMAT, disable=tqdm_desc is None) as progress_bar:
-        for inputs_batch, labels_batch in eval_dataloader:
-            loss_batch, logits_batch = eval_step(state, inputs_batch, labels_batch)
+        for inputs_spectrogram_batch, inputs_tabular_batch, labels_batch in eval_dataloader:
+            loss_batch, logits_batch = eval_step(state, inputs_spectrogram_batch, inputs_tabular_batch, labels_batch)
             logits_list.append(logits_batch)
             labels_list.append(labels_batch)
             eval_loss += loss_batch
@@ -114,109 +118,42 @@ def evaluate(state: TrainState, eval_dataloader, num_classes: int,
         eval_loss /= len(eval_dataloader)
         logits = jnp.concatenate(logits_list)
         y_true = jnp.concatenate(labels_list)
-        if debug:
-            print(f"logits = {logits}")
 
+        # Convert to NumPy arrays for sklearn compatibility
+        y_probs = jax.nn.sigmoid(logits) if num_classes == 2 else jax.nn.softmax(logits, axis=-1)
+        y_probs_np = np.array(y_probs)
+        y_true_np = np.array(y_true)
+
+        # Determine optimal threshold and compute metrics
         if num_classes == 2:
-            y_probs = jax.nn.sigmoid(logits)
-            y_pred_labels = (y_probs >= 0.5).astype(jnp.int32)
+            fpr, tpr, thresholds = roc_curve(y_true_np, y_probs_np)
+            optimal_idx = np.argmax(tpr - fpr)
+            optimal_threshold = thresholds[optimal_idx]
+            y_pred_labels = (y_probs_np >= optimal_threshold).astype(np.int32)
+            eval_auc = auc(fpr, tpr)
+            eval_fpr, eval_tpr = fpr, tpr
         else:
-            y_probs = jax.nn.softmax(logits, axis=1)
-            y_pred_labels = jnp.argmax(y_probs, axis=1)
-
-        if debug:
-            print(f"y_probs = {y_probs}")
-            print(f"y_pred_labels = {y_pred_labels}")
-            print(f"y_true = {y_true}")
+            y_pred_labels = np.argmax(y_probs_np, axis=1)
+            eval_auc = roc_auc_score(y_true_np, y_probs_np, multi_class='ovr')
+            eval_fpr, eval_tpr = None, None
 
         # Compute accuracy
-        eval_accuracy = jnp.mean(y_pred_labels == y_true)
-        # Compute AUC and ROC curve
-        if num_classes == 2:
-            y_true_np = np.array(y_true)
-            y_probs_np = np.array(y_probs)
-            eval_fpr, eval_tpr, _ = roc_curve(y_true_np, y_probs_np)
-            eval_auc = auc(eval_fpr, eval_tpr)
-        else:
-            eval_fpr, eval_tpr = None, None
-            eval_auc = roc_auc_score(y_true, y_probs, multi_class='ovr')
+        eval_accuracy = accuracy_score(y_true_np, y_pred_labels)
 
-        progress_bar.set_postfix_str(f"Loss = {eval_loss:.4f}, Acc = {eval_accuracy:.3f}, AUC = {eval_auc:.3f}")
-    return eval_loss, eval_accuracy, eval_auc, y_true, y_pred_labels, eval_fpr, eval_tpr
+        if debug:
+            print(f"Unique predicted labels: {np.unique(y_pred_labels)}")
+            print(f"Unique true labels: {np.unique(y_true_np)}")
+            print(f"Confusion Matrix:\n{confusion_matrix(y_true_np, y_pred_labels)}")
 
-def evaluate_ensemble(states: list[TrainState], eval_dataloader, num_classes: int,
-                      tqdm_desc: Optional[str] = "Testing Ensemble", debug: bool = False) -> tuple[float, float, float, npt.ArrayLike, npt.ArrayLike, npt.ArrayLike, npt.ArrayLike]:
-    """
-    Evaluates an ensemble of models on the given dataloader.
-
-    Args:
-        states: A list of TrainState instances for each model in the ensemble.
-        eval_dataloader: The dataloader to evaluate on.
-        num_classes: The number of classes.
-        tqdm_desc: The description to use for the tqdm progress bar.
-        debug: Whether to print extra information for debugging.
-
-    Returns:
-        eval_loss: The average loss.
-        eval_accuracy: The accuracy.
-        eval_auc: The AUC score.
-        y_true: The true labels.
-        y_pred_labels: The predicted labels.
-        eval_fpr: False positive rates (for ROC curve).
-        eval_tpr: True positive rates (for ROC curve).
-    """
-    ensemble_logits_list = []
-    labels_list = []
-    eval_loss = 0.0
-
-    with tqdm(total=len(eval_dataloader), desc=tqdm_desc, unit="batch", bar_format=TQDM_BAR_FORMAT, disable=tqdm_desc is None) as progress_bar:
-        for inputs_batch, labels_batch in eval_dataloader:
-            batch_logits = []
-            batch_loss = 0.0
-            for state in states:
-                loss_batch, logits_batch = eval_step(state, inputs_batch, labels_batch)
-                batch_logits.append(logits_batch)
-                batch_loss += loss_batch
-            # Average loss over ensemble
-            eval_loss += batch_loss / len(states)
-            # Stack logits from each model and average them
-            avg_logits = jnp.mean(jnp.stack(batch_logits), axis=0)
-            ensemble_logits_list.append(avg_logits)
-            labels_list.append(labels_batch)
-            progress_bar.update(1)
-        eval_loss /= len(eval_dataloader)
-        logits = jnp.concatenate(ensemble_logits_list)
-        y_true = jnp.concatenate(labels_list)
-
-        if num_classes == 2:
-            y_probs = jax.nn.sigmoid(logits)
-            y_pred_labels = (y_probs >= 0.5).astype(jnp.int32)
-        else:
-            y_probs = jax.nn.softmax(logits, axis=1)
-            y_pred_labels = jnp.argmax(y_probs, axis=1)
-
-        eval_accuracy = jnp.mean(y_pred_labels == y_true)
-
-        # Compute AUC and ROC curve
-        if num_classes == 2:
-            y_true_np = np.array(y_true)
-            y_probs_np = np.array(y_probs)
-            eval_fpr, eval_tpr, _ = roc_curve(y_true_np, y_probs_np)
-            eval_auc = auc(eval_fpr, eval_tpr)
-        else:
-            eval_fpr, eval_tpr = None, None
-            eval_auc = roc_auc_score(y_true, y_probs, multi_class='ovr')
-
-        progress_bar.set_postfix_str(f"Loss = {eval_loss:.4f}, Acc = {eval_accuracy:.3f}, AUC = {eval_auc:.3f}")
-
-    return eval_loss, eval_accuracy, eval_auc, y_true, y_pred_labels, eval_fpr, eval_tpr
+        progress_bar.set_postfix_str(f"Loss = {eval_loss:.4f}, AUC = {eval_auc:.3f}")
+    return eval_loss, eval_accuracy, eval_auc, y_true_np, y_pred_labels, eval_fpr, eval_tpr
 
 def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_dataloader, test_dataloader, num_classes: int,
-                       num_epochs: int, ensemble_size: int = 1, lrs_peak_value: float = 1e-3,
+                       num_epochs: int, lrs_peak_value: float = 1e-3,
                        lrs_warmup_steps: int = 5000, lrs_decay_steps: int = 50000,
                        seed: int = 42, use_ray: bool = False, debug: bool = False) -> dict:
     """
-    Trains the given model(s) on the provided dataloaders and evaluates them.
+    Trains the given model on the provided dataloaders and evaluates it.
 
     Args:
         model_fn: A callable that returns a new instance of the model.
@@ -225,7 +162,6 @@ def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_
         test_dataloader: The dataloader for the test set.
         num_classes: The number of classes.
         num_epochs: The number of epochs to train for.
-        ensemble_size: The number of models to train for ensembling.
         lrs_peak_value: The peak value of the learning rate schedule.
         lrs_warmup_steps: The number of warmup steps.
         lrs_decay_steps: The number of decay steps.
@@ -239,12 +175,9 @@ def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_
     if use_ray:
         from ray.air import session
 
-    ensemble_states = []
     metrics = {
         'train_losses': [],
         'val_losses': [],
-        'train_accuracies': [],
-        'val_accuracies': [],
         'train_aucs': [],
         'val_aucs': [],
         'test_loss': 0.0,
@@ -255,92 +188,98 @@ def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_
         'eval_tpr': None,
     }
 
-    for ensemble_idx in range(ensemble_size):
-        print(f"\nTraining model {ensemble_idx + 1}/{ensemble_size} for ensembling...")
-        root_key = jax.random.PRNGKey(seed=seed + ensemble_idx)
-        root_key, params_key, train_key = jax.random.split(key=root_key, num=3)
+    print(f"\nTraining model...")
+    root_key = jax.random.PRNGKey(seed=seed)
+    root_key, params_key, train_key = jax.random.split(key=root_key, num=3)
 
-        # Initialize model
-        model = model_fn()
+    # Initialize model
+    model = model_fn()
 
-        dummy_batch = next(iter(train_dataloader))[0]
-        input_shape = dummy_batch.shape[1:]
-        input_dtype = dummy_batch.dtype
-        batch_size = dummy_batch.shape[0]
-        root_key, input_key = jax.random.split(key=root_key)
-        if jnp.issubdtype(input_dtype, jnp.floating):
-            dummy_batch = jax.random.uniform(key=input_key, shape=(batch_size,) + input_shape, dtype=input_dtype)
-        elif jnp.issubdtype(input_dtype, jnp.integer):
-            dummy_batch = jax.random.randint(key=input_key, shape=(batch_size,) + input_shape, minval=0, maxval=100, dtype=input_dtype)
-        else:
-            raise ValueError(f"Unsupported dtype {input_dtype}")
+    # Get a batch to determine input shapes
+    dummy_batch_spectrogram, dummy_batch_tabular, _ = next(iter(train_dataloader))
+    input_shape_spectrogram = dummy_batch_spectrogram.shape[1:]
+    input_shape_tabular = dummy_batch_tabular.shape[1:]
+    input_dtype_spectrogram = dummy_batch_spectrogram.dtype
+    input_dtype_tabular = dummy_batch_tabular.dtype
+    batch_size = dummy_batch_spectrogram.shape[0]
+    root_key, input_key = jax.random.split(key=root_key)
+    if jnp.issubdtype(input_dtype_spectrogram, jnp.floating):
+        dummy_batch_spectrogram = jax.random.uniform(key=input_key, shape=(batch_size,) + input_shape_spectrogram, dtype=input_dtype_spectrogram)
+    else:
+        raise ValueError(f"Unsupported dtype {input_dtype_spectrogram}")
+    if jnp.issubdtype(input_dtype_tabular, jnp.floating):
+        dummy_batch_tabular = jax.random.uniform(key=input_key, shape=(batch_size,) + input_shape_tabular, dtype=input_dtype_tabular)
+    else:
+        raise ValueError(f"Unsupported dtype {input_dtype_tabular}")
 
-        variables = model.init(params_key, dummy_batch, train=False)
+    variables = model.init(params_key, x_spectrogram=dummy_batch_spectrogram, x_tabular=dummy_batch_tabular, train=False)
 
-        if debug:
-            print(jax.tree_map(lambda x: x.shape, variables))
-        print(f"Number of parameters = {sum(x.size for x in jax.tree_util.tree_leaves(variables))}")
+    if debug:
+        print(jax.tree_map(lambda x: x.shape, variables))
+    print(f"Number of parameters = {sum(x.size for x in jax.tree_util.tree_leaves(variables))}")
 
-        learning_rate_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=0.0,
-            peak_value=lrs_peak_value,
-            warmup_steps=lrs_warmup_steps,
-            decay_steps=lrs_decay_steps,
-            end_value=0.0
-        )
+    learning_rate_schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=lrs_peak_value,
+        warmup_steps=lrs_warmup_steps,
+        decay_steps=lrs_decay_steps,
+        end_value=0.0
+    )
 
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(1.0),
-            optax.adamw(learning_rate=learning_rate_schedule),
-        )
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adamw(learning_rate=learning_rate_schedule),
+    )
 
-        state = TrainState.create(
-            apply_fn=model.apply,
-            params=variables['params'],
-            key=train_key,
-            tx=optimizer
-        )
+    state = TrainState.create(
+        apply_fn=model.apply,
+        params=variables['params'],
+        key=train_key,
+        tx=optimizer
+    )
 
-        best_val_auc, best_epoch, best_state = 0.0, 0, None
-        total_train_time = 0.0
-        start_time = time.time()
+    best_val_auc, best_epoch, best_state = 0.0, 0, None
+    total_train_time = 0.0
+    start_time = time.time()
 
-        for epoch in range(num_epochs):
-            with tqdm(total=len(train_dataloader), desc=f"Model {ensemble_idx+1}, Epoch {epoch+1}/{num_epochs}", unit="batch", bar_format=TQDM_BAR_FORMAT) as progress_bar:
-                epoch_train_time = time.time()
-                for inputs_batch, labels_batch in train_dataloader:
-                    state = train_step(state, inputs_batch, labels_batch, train_key)
-                    progress_bar.update(1)
-                epoch_train_time = time.time() - epoch_train_time
-                total_train_time += epoch_train_time
+    for epoch in range(num_epochs):
+        with tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch", bar_format=TQDM_BAR_FORMAT) as progress_bar:
+            epoch_train_time = time.time()
+            for inputs_spectrogram_batch, inputs_tabular_batch, labels_batch in train_dataloader:
+                state = train_step(state, inputs_spectrogram_batch, inputs_tabular_batch, labels_batch, train_key)
+                progress_bar.update(1)
+            epoch_train_time = time.time() - epoch_train_time
+            total_train_time += epoch_train_time
 
-                train_loss, train_accuracy, train_auc, _, _, _, _ = evaluate(state, train_dataloader, num_classes, tqdm_desc=None, debug=debug)
-                val_loss, val_accuracy, val_auc, _, _, _, _ = evaluate(state, val_dataloader, num_classes, tqdm_desc=None, debug=debug)
-                progress_bar.set_postfix_str(f"Val Loss = {val_loss:.4f}, Val Acc = {val_accuracy:.3f}, Val AUC = {val_auc:.3f}, Train time = {epoch_train_time:.2f}s")
+            # Evaluate on validation set
+            val_loss, val_accuracy, val_auc, _, _, _, _ = evaluate(state, val_dataloader, num_classes, tqdm_desc=None, debug=debug)
+            progress_bar.set_postfix_str(f"Val Loss = {val_loss:.4f}, AUC = {val_auc:.3f}, Train time = {epoch_train_time:.2f}s")
 
-                if val_auc > best_val_auc:
-                    best_val_auc = val_auc
-                    best_epoch = epoch + 1
-                    best_state = state
+            metrics['val_losses'].append(val_loss)
+            metrics['val_aucs'].append(val_auc)
 
-                if use_ray:
-                    session.report({'val_loss': val_loss, 'val_accuracy': val_accuracy, 'val_auc': val_auc, 'best_val_auc': best_val_auc, 'best_epoch': best_epoch})
+            if val_auc > best_val_auc:
+                best_val_auc = val_auc
+                best_epoch = epoch + 1
+                best_state = state
 
-        print(f"Best validation AUC for model {ensemble_idx+1} = {best_val_auc:.3f} at epoch {best_epoch}")
-        print(f"Total training time for model {ensemble_idx+1} = {total_train_time:.2f}s, total time (including evaluations) = {time.time() - start_time:.2f}s")
+            if use_ray:
+                session.report({'val_loss': val_loss, 'val_auc': val_auc, 'best_val_auc': best_val_auc, 'best_epoch': best_epoch})
 
-        ensemble_states.append(best_state)
+    print(f"Best validation AUC = {best_val_auc:.3f} at epoch {best_epoch}")
+    print(f"Total training time = {total_train_time:.2f}s, total time (including evaluations) = {time.time() - start_time:.2f}s")
 
-    # Evaluate ensemble on test set
-    test_loss, test_accuracy, test_auc, y_true, y_pred_labels, eval_fpr, eval_tpr = evaluate_ensemble(ensemble_states, test_dataloader, num_classes, debug=debug)
-
-    # Generate classification report
+    # Evaluate on test set using the best model
+    assert best_state is not None
+    test_loss, test_accuracy, test_auc, y_true, y_pred_labels, eval_fpr, eval_tpr = evaluate(best_state, test_dataloader, num_classes, tqdm_desc="Testing", debug=debug)
     metrics['test_loss'] = test_loss
     metrics['test_accuracy'] = test_accuracy
     metrics['test_auc'] = test_auc
     metrics['eval_fpr'] = eval_fpr
     metrics['eval_tpr'] = eval_tpr
     metrics['test_classification_report'] = classification_report(y_true, y_pred_labels, digits=4)
+
+    # Print the classification report
     print("\nTest Classification Report:")
     print(metrics['test_classification_report'])
 
