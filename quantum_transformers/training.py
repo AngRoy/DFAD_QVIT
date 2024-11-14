@@ -1,5 +1,7 @@
+# training.py
+
 import time
-from typing import Optional, Callable
+from typing import Optional, Callable, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -8,29 +10,30 @@ import jax.numpy as jnp
 import flax.linen as nn
 import flax.training.train_state
 import optax
-from sklearn.metrics import roc_auc_score, roc_curve, auc, classification_report, accuracy_score
+from sklearn.metrics import roc_auc_score, roc_curve, auc, classification_report, accuracy_score, confusion_matrix
 from tqdm import tqdm
 
 TQDM_BAR_FORMAT = '{l_bar}{bar:10}{r_bar}{bar:-10b}'
 
 class TrainState(flax.training.train_state.TrainState):
-    # See https://flax.readthedocs.io/en/latest/guides/dropout.html.
+    """
+    Extends Flax's TrainState to include a random key for dropout.
+    """
     key: jax.random.KeyArray  # type: ignore
 
 @jax.jit
-def train_step(state: TrainState, inputs_spectrogram: jax.Array, inputs_tabular: jax.Array, labels: jax.Array, key: jax.random.KeyArray) -> TrainState:
+def train_step(state: TrainState, inputs: jax.Array, labels: jax.Array, key: jax.random.KeyArray) -> Tuple[TrainState, float]:
     """
     Performs a single training step on the given batch of inputs and labels.
 
     Args:
         state: The current training state.
-        inputs_spectrogram: Batch of spectrogram inputs.
-        inputs_tabular: Batch of tabular inputs.
+        inputs: The batch of spectrogram inputs.
         labels: The batch of labels.
         key: The random key to use.
 
     Returns:
-        The updated training state.
+        Updated training state and the loss value.
     """
     key, dropout_key = jax.random.split(key=key)
     dropout_train_key = jax.random.fold_in(key=dropout_key, data=state.step)
@@ -38,8 +41,7 @@ def train_step(state: TrainState, inputs_spectrogram: jax.Array, inputs_tabular:
     def loss_fn(params):
         logits = state.apply_fn(
             {'params': params},
-            x_spectrogram=inputs_spectrogram,
-            x_tabular=inputs_tabular,
+            x=inputs,  # Changed from x_spectrogram=inputs to x=inputs
             train=True,
             rngs={'dropout': dropout_train_key}
         )
@@ -53,27 +55,25 @@ def train_step(state: TrainState, inputs_spectrogram: jax.Array, inputs_tabular:
 
     grads = jax.grad(loss_fn)(state.params)
     state = state.apply_gradients(grads=grads)
-    return state
+    loss = loss_fn(state.params)
+    return state, loss
 
 @jax.jit
-def eval_step(state: TrainState, inputs_spectrogram: jax.Array, inputs_tabular: jax.Array, labels: jax.Array) -> tuple[float, jax.Array]:
+def eval_step(state: TrainState, inputs: jax.Array, labels: jax.Array) -> Tuple[float, jax.Array]:
     """
     Performs a single evaluation step on the given batch of inputs and labels.
 
     Args:
         state: The current training state.
-        inputs_spectrogram: Batch of spectrogram inputs.
-        inputs_tabular: Batch of tabular inputs.
+        inputs: The batch of spectrogram inputs.
         labels: The batch of labels.
 
     Returns:
-        loss: The loss on the given batch.
-        logits: The logits on the given batch.
+        Loss and logits on the given batch.
     """
     logits = state.apply_fn(
         {'params': state.params},
-        x_spectrogram=inputs_spectrogram,
-        x_tabular=inputs_tabular,
+        x=inputs,  # Changed from x_spectrogram=inputs to x=inputs
         train=False,
         rngs={'dropout': state.key}
     )
@@ -86,7 +86,7 @@ def eval_step(state: TrainState, inputs_spectrogram: jax.Array, inputs_tabular: 
     return loss, logits
 
 def evaluate(state: TrainState, eval_dataloader, num_classes: int,
-             tqdm_desc: Optional[str] = None, debug: bool = False) -> tuple[float, float, float, npt.ArrayLike, npt.ArrayLike, npt.ArrayLike, npt.ArrayLike]:
+             tqdm_desc: Optional[str] = None, debug: bool = False) -> Tuple[float, float, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Evaluates the model given the current training state on the given dataloader.
 
@@ -99,7 +99,6 @@ def evaluate(state: TrainState, eval_dataloader, num_classes: int,
 
     Returns:
         eval_loss: The average loss.
-        eval_accuracy: The accuracy.
         eval_auc: The AUC score.
         y_true: The true labels.
         y_pred_labels: The predicted labels.
@@ -108,9 +107,10 @@ def evaluate(state: TrainState, eval_dataloader, num_classes: int,
     """
     logits_list, labels_list = [], []
     eval_loss = 0.0
-    with tqdm(total=len(eval_dataloader), desc=tqdm_desc, unit="batch", bar_format=TQDM_BAR_FORMAT, disable=tqdm_desc is None) as progress_bar:
-        for inputs_spectrogram_batch, inputs_tabular_batch, labels_batch in eval_dataloader:
-            loss_batch, logits_batch = eval_step(state, inputs_spectrogram_batch, inputs_tabular_batch, labels_batch)
+    with tqdm(total=len(eval_dataloader), desc=tqdm_desc, unit="batch",
+              bar_format=TQDM_BAR_FORMAT, disable=tqdm_desc is None) as progress_bar:
+        for inputs_batch, labels_batch in eval_dataloader:
+            loss_batch, logits_batch = eval_step(state, inputs_batch, labels_batch)
             logits_list.append(logits_batch)
             labels_list.append(labels_batch)
             eval_loss += loss_batch
@@ -146,7 +146,8 @@ def evaluate(state: TrainState, eval_dataloader, num_classes: int,
             print(f"Confusion Matrix:\n{confusion_matrix(y_true_np, y_pred_labels)}")
 
         progress_bar.set_postfix_str(f"Loss = {eval_loss:.4f}, AUC = {eval_auc:.3f}")
-    return eval_loss, eval_accuracy, eval_auc, y_true_np, y_pred_labels, eval_fpr, eval_tpr
+
+    return eval_loss, eval_auc, y_true_np, y_pred_labels, eval_fpr, eval_tpr
 
 def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_dataloader, test_dataloader, num_classes: int,
                        num_epochs: int, lrs_peak_value: float = 1e-3,
@@ -178,17 +179,18 @@ def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_
     metrics = {
         'train_losses': [],
         'val_losses': [],
-        'train_aucs': [],
         'val_aucs': [],
         'test_loss': 0.0,
-        'test_accuracy': 0.0,
         'test_auc': 0.0,
+        'y_true_test': None,
+        'y_pred_test': None,
+        'test_fpr': None,
+        'test_tpr': None,
         'test_classification_report': None,
-        'eval_fpr': None,
-        'eval_tpr': None,
+        'best_state': None,
     }
 
-    print(f"\nTraining model...")
+    print("\nTraining model...")
     root_key = jax.random.PRNGKey(seed=seed)
     root_key, params_key, train_key = jax.random.split(key=root_key, num=3)
 
@@ -196,23 +198,17 @@ def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_
     model = model_fn()
 
     # Get a batch to determine input shapes
-    dummy_batch_spectrogram, dummy_batch_tabular, _ = next(iter(train_dataloader))
+    dummy_batch_spectrogram, labels_dummy = next(iter(train_dataloader))
     input_shape_spectrogram = dummy_batch_spectrogram.shape[1:]
-    input_shape_tabular = dummy_batch_tabular.shape[1:]
     input_dtype_spectrogram = dummy_batch_spectrogram.dtype
-    input_dtype_tabular = dummy_batch_tabular.dtype
     batch_size = dummy_batch_spectrogram.shape[0]
     root_key, input_key = jax.random.split(key=root_key)
     if jnp.issubdtype(input_dtype_spectrogram, jnp.floating):
         dummy_batch_spectrogram = jax.random.uniform(key=input_key, shape=(batch_size,) + input_shape_spectrogram, dtype=input_dtype_spectrogram)
     else:
         raise ValueError(f"Unsupported dtype {input_dtype_spectrogram}")
-    if jnp.issubdtype(input_dtype_tabular, jnp.floating):
-        dummy_batch_tabular = jax.random.uniform(key=input_key, shape=(batch_size,) + input_shape_tabular, dtype=input_dtype_tabular)
-    else:
-        raise ValueError(f"Unsupported dtype {input_dtype_tabular}")
 
-    variables = model.init(params_key, x_spectrogram=dummy_batch_spectrogram, x_tabular=dummy_batch_tabular, train=False)
+    variables = model.init(params_key, x=dummy_batch_spectrogram, train=False)
 
     if debug:
         print(jax.tree_map(lambda x: x.shape, variables))
@@ -234,8 +230,8 @@ def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_
     state = TrainState.create(
         apply_fn=model.apply,
         params=variables['params'],
-        key=train_key,
-        tx=optimizer
+        tx=optimizer,
+        key=train_key
     )
 
     best_val_auc, best_epoch, best_state = 0.0, 0, None
@@ -243,20 +239,26 @@ def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_
     start_time = time.time()
 
     for epoch in range(num_epochs):
-        with tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch", bar_format=TQDM_BAR_FORMAT) as progress_bar:
+        with tqdm(total=len(train_dataloader), desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch",
+                  bar_format=TQDM_BAR_FORMAT) as progress_bar:
             epoch_train_time = time.time()
-            for inputs_spectrogram_batch, inputs_tabular_batch, labels_batch in train_dataloader:
-                state = train_step(state, inputs_spectrogram_batch, inputs_tabular_batch, labels_batch, train_key)
+            epoch_loss = 0.0
+            for inputs_batch, labels_batch in train_dataloader:
+                state, loss = train_step(state, inputs_batch, labels_batch, state.key)
+                epoch_loss += loss
                 progress_bar.update(1)
             epoch_train_time = time.time() - epoch_train_time
             total_train_time += epoch_train_time
 
-            # Evaluate on validation set
-            val_loss, val_accuracy, val_auc, _, _, _, _ = evaluate(state, val_dataloader, num_classes, tqdm_desc=None, debug=debug)
-            progress_bar.set_postfix_str(f"Val Loss = {val_loss:.4f}, AUC = {val_auc:.3f}, Train time = {epoch_train_time:.2f}s")
+            epoch_loss /= len(train_dataloader)
+            metrics['train_losses'].append(epoch_loss)
 
+            # Evaluate on validation set
+            val_loss, val_auc, _, _, _, _ = evaluate(state, val_dataloader, num_classes, tqdm_desc=None, debug=debug)
             metrics['val_losses'].append(val_loss)
             metrics['val_aucs'].append(val_auc)
+
+            progress_bar.set_postfix_str(f"Val Loss = {val_loss:.4f}, AUC = {val_auc:.3f}, Train time = {epoch_train_time:.2f}s")
 
             if val_auc > best_val_auc:
                 best_val_auc = val_auc
@@ -266,23 +268,19 @@ def train_and_evaluate(model_fn: Callable[[], nn.Module], train_dataloader, val_
             if use_ray:
                 session.report({'val_loss': val_loss, 'val_auc': val_auc, 'best_val_auc': best_val_auc, 'best_epoch': best_epoch})
 
-    print(f"Best validation AUC = {best_val_auc:.3f} at epoch {best_epoch}")
+    print(f"\nBest validation AUC = {best_val_auc:.3f} at epoch {best_epoch}")
     print(f"Total training time = {total_train_time:.2f}s, total time (including evaluations) = {time.time() - start_time:.2f}s")
 
     # Evaluate on test set using the best model
-    assert best_state is not None
-    test_loss, test_accuracy, test_auc, y_true, y_pred_labels, eval_fpr, eval_tpr = evaluate(best_state, test_dataloader, num_classes, tqdm_desc="Testing", debug=debug)
+    assert best_state is not None, "Best state is None. Training might have failed."
+    metrics['best_state'] = best_state
+    test_loss, test_auc, y_true_test, y_pred_test, eval_fpr, eval_tpr = evaluate(best_state, test_dataloader, num_classes, tqdm_desc="Testing", debug=debug)
     metrics['test_loss'] = test_loss
-    metrics['test_accuracy'] = test_accuracy
     metrics['test_auc'] = test_auc
-    metrics['eval_fpr'] = eval_fpr
-    metrics['eval_tpr'] = eval_tpr
-    metrics['test_classification_report'] = classification_report(y_true, y_pred_labels, digits=4)
+    metrics['y_true_test'] = y_true_test
+    metrics['y_pred_test'] = y_pred_test
+    metrics['test_fpr'] = eval_fpr
+    metrics['test_tpr'] = eval_tpr
+    metrics['test_classification_report'] = classification_report(y_true_test, y_pred_test, digits=4)
 
-    # Print the classification report
-    print("\nTest Classification Report:")
-    print(metrics['test_classification_report'])
-
-    if use_ray:
-        session.report({'test_loss': test_loss, 'test_accuracy': test_accuracy, 'test_auc': test_auc})
     return metrics
